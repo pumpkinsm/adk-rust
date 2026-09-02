@@ -562,3 +562,76 @@ async fn test_run_sse_with_different_mime_types() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_run_sse_accepts_file_data_url() {
+    let app = create_test_app();
+
+    let body = serde_json::json!({
+        "appName": "test-app",
+        "userId": "user123",
+        "sessionId": "session456",
+        "newMessage": {
+            "role": "user",
+            "parts": [
+                {"text": "Describe this image"},
+                {
+                    "fileData": {
+                        "fileUri": "https://example.com/photo.jpg",
+                        "mimeType": "image/jpeg"
+                    }
+                }
+            ]
+        },
+        "streaming": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/run_sse")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_run_sse_rejects_empty_file_data_uri() {
+    let app = create_test_app();
+
+    let body = serde_json::json!({
+        "appName": "test-app",
+        "userId": "user123",
+        "sessionId": "session456",
+        "newMessage": {
+            "role": "user",
+            "parts": [{
+                "fileData": {
+                    "fileUri": "   ",
+                    "mimeType": "image/jpeg"
+                }
+            }]
+        },
+        "streaming": true
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/run_sse")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

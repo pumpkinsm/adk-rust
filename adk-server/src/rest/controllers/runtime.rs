@@ -163,6 +163,8 @@ pub struct MessagePart {
     pub text: Option<String>,
     #[serde(default, rename = "inlineData")]
     pub inline_data: Option<InlineData>,
+    #[serde(default, rename = "fileData")]
+    pub file_data: Option<FileData>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -170,6 +172,21 @@ pub struct MessagePart {
 pub struct InlineData {
     pub display_name: Option<String>,
     pub data: String,
+    pub mime_type: String,
+}
+
+/// An attachment referenced by URL in a runtime request.
+///
+/// The runtime forwards the URI to the configured model provider without
+/// downloading the resource itself.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FileData {
+    /// Optional name supplied by the client for display purposes.
+    pub display_name: Option<String>,
+    /// URI that the model provider can use to retrieve the attachment.
+    pub file_uri: String,
+    /// MIME type of the referenced attachment.
     pub mime_type: String,
 }
 
@@ -403,7 +420,7 @@ fn new_message_from_ag_ui_input(input: &AgUiRunInput) -> Option<NewMessage> {
     let content = selected.content.as_ref()?;
     let parts: Vec<MessagePart> = extract_text_segments(content)
         .into_iter()
-        .map(|text| MessagePart { text: Some(text), inline_data: None })
+        .map(|text| MessagePart { text: Some(text), inline_data: None, file_data: None })
         .collect();
     if parts.is_empty() {
         return None;
@@ -634,6 +651,20 @@ fn build_content_from_parts(parts: &[MessagePart]) -> Result<adk_core::Content, 
                     ));
                 }
             }
+        }
+
+        if let Some(file_data) = &part.file_data {
+            if file_data.file_uri.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "fileData.fileUri must not be empty".to_string(),
+                ));
+            }
+            content.parts.push(adk_core::Part::FileData {
+                mime_type: file_data.mime_type.clone(),
+                file_uri: file_data.file_uri.clone(),
+                annotations: None,
+            });
         }
     }
 
