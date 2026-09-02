@@ -73,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Streamed conversation history** (`adk-agent`): adjacent text and reasoning
+  transport chunks are coalesced before history replay without crossing tool or
+  attachment boundaries, preventing chunk boundaries from becoming line breaks
+  in later model requests.
 - **OpenAI-compatible streaming usage** (`adk-model`): usage-only terminal
   chunks with empty `choices` attach token counts to the final response.
 - **Span parenting across suspension points** (`adk-agent`, `adk-runner`): one

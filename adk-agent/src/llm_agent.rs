@@ -637,6 +637,38 @@ fn extract_text_from_events(events: &[Event]) -> Option<String> {
     None
 }
 
+// Provider chunks are transport fragments, not semantic content boundaries.
+// Keep non-text parts as hard boundaries so history preserves their ordering.
+fn accumulate_model_content(accumulated: &mut Option<Content>, incoming: Content) {
+    let target = accumulated.get_or_insert_with(|| Content {
+        role: incoming.role.clone(),
+        parts: Vec::with_capacity(incoming.parts.len()),
+    });
+
+    for part in incoming.parts {
+        match part {
+            Part::Text { text } => {
+                if let Some(Part::Text { text: previous }) = target.parts.last_mut() {
+                    previous.push_str(&text);
+                } else {
+                    target.parts.push(Part::Text { text });
+                }
+            }
+            Part::Thinking { thinking, signature } => {
+                if let Some(Part::Thinking { thinking: previous, signature: previous_signature }) =
+                    target.parts.last_mut()
+                    && previous_signature.as_ref() == signature.as_ref()
+                {
+                    previous.push_str(&thinking);
+                } else {
+                    target.parts.push(Part::Thinking { thinking, signature });
+                }
+            }
+            other => target.parts.push(other),
+        }
+    }
+}
+
 /// Extract a typed value from agent events.
 ///
 /// Scans events for the last text content and deserializes it into `T`.
@@ -2748,13 +2780,9 @@ impl Agent for LlmAgent {
 
                         normalize_option_content(&mut chunk.content);
 
-                        // Accumulate content for conversation history (always needed)
+                        // Accumulate content for conversation history (always needed).
                         if let Some(chunk_content) = chunk.content.clone() {
-                            if let Some(ref mut acc) = accumulated_content {
-                                acc.parts.extend(chunk_content.parts);
-                            } else {
-                                accumulated_content = Some(chunk_content);
-                            }
+                            accumulate_model_content(&mut accumulated_content, chunk_content);
                         }
 
                         // For SSE/Bidi mode: yield each chunk immediately with stable event ID
@@ -3434,5 +3462,91 @@ mod run_helper_tests {
         assert_eq!(calls[1].index, 1);
         assert_eq!(calls[1].name, "second");
         assert_eq!(calls[1].function_call_id, "provider-id");
+    }
+
+    #[test]
+    fn accumulated_provider_text_chunks_do_not_gain_part_boundaries() {
+        let mut accumulated = None;
+
+        for text in ["I", " will", " continue", "."] {
+            accumulate_model_content(
+                &mut accumulated,
+                Content {
+                    role: "model".to_string(),
+                    parts: vec![Part::Text { text: text.to_string() }],
+                },
+            );
+        }
+
+        assert_eq!(
+            accumulated.expect("content should be accumulated").parts,
+            vec![Part::Text { text: "I will continue.".to_string() }]
+        );
+    }
+
+    #[test]
+    fn accumulated_reasoning_does_not_cross_non_reasoning_parts() {
+        let mut accumulated = None;
+
+        accumulate_model_content(
+            &mut accumulated,
+            Content {
+                role: "model".to_string(),
+                parts: vec![
+                    Part::Thinking {
+                        thinking: "analyze".to_string(),
+                        signature: Some("signature".to_string()),
+                    },
+                    Part::Thinking {
+                        thinking: " then act".to_string(),
+                        signature: Some("signature".to_string()),
+                    },
+                    Part::Text { text: "start".to_string() },
+                    Part::Text { text: " now".to_string() },
+                    Part::FunctionCall {
+                        name: "lookup".to_string(),
+                        args: serde_json::json!({}),
+                        id: Some("call-1".to_string()),
+                        thought_signature: None,
+                    },
+                    Part::Text { text: "done".to_string() },
+                ],
+            },
+        );
+
+        let parts = accumulated.expect("content should be accumulated").parts;
+        assert_eq!(parts.len(), 4);
+        assert!(matches!(
+            &parts[0],
+            Part::Thinking { thinking, signature }
+                if thinking == "analyze then act" && signature.as_deref() == Some("signature")
+        ));
+        assert!(matches!(&parts[1], Part::Text { text } if text == "start now"));
+        assert!(matches!(&parts[2], Part::FunctionCall { name, .. } if name == "lookup"));
+        assert!(matches!(&parts[3], Part::Text { text } if text == "done"));
+    }
+
+    #[test]
+    fn accumulated_reasoning_keeps_different_signatures_separate() {
+        let mut accumulated = None;
+
+        accumulate_model_content(
+            &mut accumulated,
+            Content {
+                role: "model".to_string(),
+                parts: vec![
+                    Part::Thinking {
+                        thinking: "first".to_string(),
+                        signature: Some("signature-a".to_string()),
+                    },
+                    Part::Thinking {
+                        thinking: "second".to_string(),
+                        signature: Some("signature-b".to_string()),
+                    },
+                ],
+            },
+        );
+
+        assert_eq!(accumulated.expect("content should be accumulated").parts.len(), 2);
     }
 }
