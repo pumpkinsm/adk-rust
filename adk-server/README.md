@@ -309,6 +309,7 @@ deployment across several needs a shared store; implement `RunPersistence` for o
 |----------|--------|-------------|
 | `/api/run/{app_name}/{user_id}/{session_id}` | POST | Run agent with SSE |
 | `/api/run_sse` | POST | adk-go compatible SSE runtime |
+| `/api/runs/interrupt` | POST | Cancel active runtime requests by identity and optional `runId` |
 
 ### Artifacts
 

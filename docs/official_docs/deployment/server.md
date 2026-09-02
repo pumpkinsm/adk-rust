@@ -82,6 +82,7 @@ POST /api/run_sse
   "appName": "my_agent",
   "userId": "user123",
   "sessionId": "session456",
+  "runId": "generation-789",
   "newMessage": {
     "role": "user",
     "parts": [
@@ -97,6 +98,28 @@ POST /api/run_sse
 **Response:**
 - Content-Type: `text/event-stream`
 - Streams events as JSON objects
+
+### Interrupt an Active Run
+
+Cancel a streaming or aggregated runtime request using the same identity used
+to start it. Include `runId` to target one request without affecting a newer or
+concurrent run in the same session:
+
+```text
+POST /api/runs/interrupt
+```
+
+```json
+{
+  "appName": "my_agent",
+  "userId": "user123",
+  "sessionId": "session456",
+  "runId": "generation-789"
+}
+```
+
+When request-context authentication is configured, the authenticated user
+overrides `userId` in both run and interrupt requests.
 
 **Event Format:**
 ```json

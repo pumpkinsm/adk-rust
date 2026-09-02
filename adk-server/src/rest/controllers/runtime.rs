@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
@@ -34,11 +38,98 @@ const UI_TRANSPORT_HEADER: &str = "x-adk-ui-transport";
 #[derive(Clone)]
 pub struct RuntimeController {
     config: ServerConfig,
+    active_runs: ActiveRuntimeRuns,
 }
 
 impl RuntimeController {
     pub fn new(config: ServerConfig) -> Self {
-        Self { config }
+        Self { config, active_runs: ActiveRuntimeRuns::default() }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ActiveRuntimeRuns {
+    runs: Arc<Mutex<HashMap<u64, ActiveRuntimeRun>>>,
+    next_id: Arc<AtomicU64>,
+}
+
+struct ActiveRuntimeRun {
+    app_name: String,
+    user_id: String,
+    session_id: String,
+    external_run_id: String,
+    runner: Arc<adk_runner::Runner>,
+}
+
+struct ActiveRuntimeRunRegistration {
+    registry: ActiveRuntimeRuns,
+    registration_id: u64,
+}
+
+impl ActiveRuntimeRuns {
+    fn register(
+        &self,
+        app_name: &str,
+        user_id: &str,
+        session_id: &str,
+        external_run_id: Option<&str>,
+        runner: Arc<adk_runner::Runner>,
+    ) -> ActiveRuntimeRunRegistration {
+        let registration_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let external_run_id = external_run_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("run-{}", Uuid::new_v4()));
+        self.runs.lock().unwrap_or_else(|error| error.into_inner()).insert(
+            registration_id,
+            ActiveRuntimeRun {
+                app_name: app_name.to_string(),
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+                external_run_id,
+                runner,
+            },
+        );
+        ActiveRuntimeRunRegistration { registry: self.clone(), registration_id }
+    }
+
+    fn interrupt(
+        &self,
+        app_name: &str,
+        user_id: &str,
+        session_id: &str,
+        external_run_id: Option<&str>,
+    ) -> usize {
+        let requested_run_id = external_run_id.map(str::trim).filter(|value| !value.is_empty());
+        let runners: Vec<_> = self
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|run| {
+                run.app_name == app_name
+                    && run.user_id == user_id
+                    && run.session_id == session_id
+                    && requested_run_id.is_none_or(|run_id| run.external_run_id == run_id)
+            })
+            .map(|run| run.runner.clone())
+            .collect();
+
+        runners
+            .into_iter()
+            .filter(|runner| runner.interrupt_identity(app_name, user_id, session_id))
+            .count()
+    }
+}
+
+impl Drop for ActiveRuntimeRunRegistration {
+    fn drop(&mut self) {
+        self.registry
+            .runs
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.registration_id);
     }
 }
 
@@ -54,6 +145,8 @@ pub struct Attachment {
 #[derive(Serialize, Deserialize)]
 pub struct RunRequest {
     pub new_message: String,
+    #[serde(default, alias = "runId")]
+    pub run_id: Option<String>,
     #[serde(default, alias = "uiProtocol")]
     pub ui_protocol: Option<String>,
     #[serde(default)]
@@ -71,6 +164,8 @@ pub struct RunSseRequest {
     pub app_name: String,
     pub user_id: String,
     pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
     #[serde(default)]
     pub new_message: Option<NewMessage>,
     #[serde(default = "default_streaming_true")]
@@ -101,6 +196,27 @@ pub struct RunSseRequest {
     pub method: Option<String>,
     #[serde(default)]
     pub params: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptRunRequest {
+    pub app_name: String,
+    pub user_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptRunResponse {
+    pub interrupted: bool,
+    pub interrupted_count: usize,
+    pub app_name: String,
+    pub user_id: String,
+    pub session_id: String,
+    pub run_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -1130,6 +1246,22 @@ where
     })
 }
 
+fn guard_active_runtime_run<S>(
+    stream: S,
+    registration: ActiveRuntimeRunRegistration,
+) -> impl Stream<Item = Result<Event, Infallible>> + Send
+where
+    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    async_stream::stream! {
+        let _registration = registration;
+        futures::pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            yield item;
+        }
+    }
+}
+
 pub async fn run_sse(
     State(controller): State<RuntimeController>,
     Path((app_name, user_id, session_id)): Path<(String, String, String)>,
@@ -1210,7 +1342,7 @@ pub async fn run_sse(
         if let Some(request_context) = request_context {
             runner_builder = runner_builder.request_context(request_context);
         }
-        let runner = runner_builder.build().map_err(adk_err_to_runtime)?;
+        let runner = Arc::new(runner_builder.build().map_err(adk_err_to_runtime)?);
 
         // Build content with attachments
         let content = build_content_with_attachments(&req.new_message, &req.attachments)?;
@@ -1222,19 +1354,27 @@ pub async fn run_sse(
 
         // Run agent
         let typed_user_id =
-            UserId::new(effective_user_id).map_err(|err| adk_err_to_runtime(err.into()))?;
+            UserId::new(effective_user_id.clone()).map_err(|err| adk_err_to_runtime(err.into()))?;
         let typed_session_id =
             SessionId::new(session_id.clone()).map_err(|err| adk_err_to_runtime(err.into()))?;
         let event_stream = runner
             .run(typed_user_id, typed_session_id, content)
             .await
             .map_err(adk_err_to_runtime)?;
+        let registration = controller.active_runs.register(
+            &app_name,
+            &effective_user_id,
+            &session_id,
+            req.run_id.as_deref(),
+            runner,
+        );
 
         // Convert to SSE stream
         let sse_stream =
             build_runtime_sse_stream(event_stream, ui_profile, transport, session_id.clone(), None);
 
-        Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+        Ok(Sse::new(guard_active_runtime_run(sse_stream, registration))
+            .keep_alive(KeepAlive::default()))
     }
     .instrument(span)
     .await
@@ -1254,6 +1394,8 @@ pub async fn run_sse_compat(
     let user_id = req.user_id.clone();
     let session_id = req.session_id.clone();
     let ag_ui_input = ag_ui_input_from_request(&req);
+    let external_run_id =
+        req.run_id.clone().or_else(|| ag_ui_input.as_ref().and_then(|input| input.run_id.clone()));
     let mcp_apps_request = mcp_apps_request_from_request(&req);
     let mcp_apps_initialize = mcp_apps_initialize_from_request(&req);
 
@@ -1380,7 +1522,7 @@ pub async fn run_sse_compat(
         if req.streaming { adk_core::StreamingMode::SSE } else { adk_core::StreamingMode::None };
 
     let mut runner_builder = adk_runner::Runner::builder()
-        .app_name(app_name)
+        .app_name(app_name.clone())
         .agent(agent)
         .session_service(controller.config.session_service.clone())
         .run_config(adk_core::RunConfig::builder().streaming_mode(streaming_mode).build());
@@ -1402,15 +1544,22 @@ pub async fn run_sse_compat(
     if let Some(request_context) = request_context {
         runner_builder = runner_builder.request_context(request_context);
     }
-    let runner = runner_builder.build().map_err(adk_err_to_runtime)?;
+    let runner = Arc::new(runner_builder.build().map_err(adk_err_to_runtime)?);
 
     // Run agent with full content (text + inline data)
     let typed_user_id =
-        UserId::new(effective_user_id).map_err(|err| adk_err_to_runtime(err.into()))?;
+        UserId::new(effective_user_id.clone()).map_err(|err| adk_err_to_runtime(err.into()))?;
     let typed_session_id =
         SessionId::new(session_id.clone()).map_err(|err| adk_err_to_runtime(err.into()))?;
     let event_stream =
         runner.run(typed_user_id, typed_session_id, content).await.map_err(adk_err_to_runtime)?;
+    let registration = controller.active_runs.register(
+        &app_name,
+        &effective_user_id,
+        &session_id,
+        external_run_id.as_deref(),
+        runner,
+    );
 
     // Convert to SSE stream
     let sse_stream = build_runtime_sse_stream(
@@ -1421,7 +1570,59 @@ pub async fn run_sse_compat(
         ag_ui_input,
     );
 
-    Ok(Sse::new(sse_stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(guard_active_runtime_run(sse_stream, registration))
+        .keep_alive(KeepAlive::default()))
+}
+
+/// Cancels active runtime requests for an authenticated identity.
+///
+/// Supplying `runId` targets one client run and prevents a stale stop request
+/// from cancelling a newer run in the same session. Without `runId`, every
+/// active runtime request for the exact app, user, and session is cancelled.
+pub async fn interrupt_run(
+    State(controller): State<RuntimeController>,
+    headers: HeaderMap,
+    Json(req): Json<InterruptRunRequest>,
+) -> Result<Json<InterruptRunResponse>, RuntimeError> {
+    if req.app_name.trim().is_empty()
+        || req.user_id.trim().is_empty()
+        || req.session_id.trim().is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "appName, userId, and sessionId are required".to_string(),
+        ));
+    }
+
+    let request_context =
+        extract_request_context(controller.config.request_context_extractor.as_deref(), &headers)
+            .await?;
+    let effective_user_id =
+        request_context.as_ref().map_or(req.user_id.clone(), |context| context.user_id.clone());
+    let interrupted_count = controller.active_runs.interrupt(
+        req.app_name.trim(),
+        effective_user_id.trim(),
+        req.session_id.trim(),
+        req.run_id.as_deref(),
+    );
+
+    info!(
+        app_name = %req.app_name,
+        user_id = %effective_user_id,
+        session_id = %req.session_id,
+        run_id = req.run_id.as_deref().unwrap_or(""),
+        interrupted_count,
+        "runtime interrupt requested"
+    );
+
+    Ok(Json(InterruptRunResponse {
+        interrupted: interrupted_count > 0,
+        interrupted_count,
+        app_name: req.app_name,
+        user_id: effective_user_id,
+        session_id: req.session_id,
+        run_id: req.run_id,
+    }))
 }
 
 /// POST /run - plain-JSON, non-streaming endpoint (Google ADK api_server parity)
@@ -1512,7 +1713,7 @@ pub async fn run_collect(
 
     // Create runner — always non-streaming for the plain-JSON endpoint
     let mut runner_builder = adk_runner::Runner::builder()
-        .app_name(app_name)
+        .app_name(app_name.clone())
         .agent(agent)
         .session_service(controller.config.session_service.clone())
         .run_config(
@@ -1536,15 +1737,22 @@ pub async fn run_collect(
     if let Some(request_context) = request_context {
         runner_builder = runner_builder.request_context(request_context);
     }
-    let runner = runner_builder.build().map_err(adk_err_to_runtime)?;
+    let runner = Arc::new(runner_builder.build().map_err(adk_err_to_runtime)?);
 
     // Run agent to completion, collecting every event
     let typed_user_id =
-        UserId::new(effective_user_id).map_err(|err| adk_err_to_runtime(err.into()))?;
+        UserId::new(effective_user_id.clone()).map_err(|err| adk_err_to_runtime(err.into()))?;
     let typed_session_id =
-        SessionId::new(session_id).map_err(|err| adk_err_to_runtime(err.into()))?;
+        SessionId::new(session_id.clone()).map_err(|err| adk_err_to_runtime(err.into()))?;
     let mut event_stream =
         runner.run(typed_user_id, typed_session_id, content).await.map_err(adk_err_to_runtime)?;
+    let _registration = controller.active_runs.register(
+        &app_name,
+        &effective_user_id,
+        &session_id,
+        req.run_id.as_deref(),
+        runner,
+    );
 
     let mut events = Vec::new();
     while let Some(event) = event_stream.next().await {

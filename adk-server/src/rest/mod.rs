@@ -391,6 +391,7 @@ pub fn create_app_with_a2a(config: ServerConfig, a2a_base_url: Option<&str>) -> 
         .route("/run", post(controllers::runtime::run_collect))
         .route("/run/{app_name}/{user_id}/{session_id}", post(controllers::runtime::run_sse))
         .route("/run_sse", post(controllers::runtime::run_sse_compat))
+        .route("/runs/interrupt", post(controllers::runtime::interrupt_run))
         .with_state(runtime_controller);
 
     let artifacts_router = Router::new()
@@ -769,6 +770,7 @@ impl ServerBuilder {
             .route("/run", post(controllers::runtime::run_collect))
             .route("/run/{app_name}/{user_id}/{session_id}", post(controllers::runtime::run_sse))
             .route("/run_sse", post(controllers::runtime::run_sse_compat))
+            .route("/runs/interrupt", post(controllers::runtime::interrupt_run))
             .with_state(runtime_controller);
 
         let artifacts_router = Router::new()

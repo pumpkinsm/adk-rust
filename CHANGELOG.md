@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Runtime clients can cancel one active request by authenticated session
+  identity and client `runId`, using the Runner's native cancellation registry.
+
 ## [2.2.0] - 2026-09-01
 
 ### Added
