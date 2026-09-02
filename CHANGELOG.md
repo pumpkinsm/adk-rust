@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Runner session history now records a streamed model response once, as its
+  consolidated terminal event, while live tool-progress chunks remain transient.
+
 ## [2.2.0] - 2026-09-01
 
 ### Added

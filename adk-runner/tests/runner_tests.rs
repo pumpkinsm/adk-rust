@@ -144,6 +144,80 @@ impl SessionService for MockSessionService {
     }
 }
 
+#[derive(Default)]
+struct RecordingSessionService {
+    appended: Mutex<Vec<Event>>,
+}
+
+#[async_trait]
+impl SessionService for RecordingSessionService {
+    async fn create(&self, _req: adk_session::CreateRequest) -> Result<Box<dyn Session>> {
+        unimplemented!()
+    }
+
+    async fn get(&self, req: GetRequest) -> Result<Box<dyn Session>> {
+        Ok(Box::new(MockSession {
+            id: req.session_id,
+            app_name: req.app_name,
+            user_id: req.user_id,
+            events: MockEvents { events: vec![] },
+            state: MockState,
+        }))
+    }
+
+    async fn list(&self, _req: adk_session::ListRequest) -> Result<Vec<Box<dyn Session>>> {
+        Ok(vec![])
+    }
+
+    async fn delete(&self, _req: adk_session::DeleteRequest) -> Result<()> {
+        Ok(())
+    }
+
+    async fn append_event(&self, _session_id: &str, event: Event) -> Result<()> {
+        self.appended.lock().expect("recording mutex poisoned").push(event);
+        Ok(())
+    }
+}
+
+struct StreamingAgent;
+
+#[async_trait]
+impl Agent for StreamingAgent {
+    fn name(&self) -> &str {
+        "streaming_agent"
+    }
+
+    fn description(&self) -> &str {
+        "emits model deltas, tool progress, and an empty terminal event"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let invocation_id = ctx.invocation_id().to_string();
+        let mut first = Event::with_id("response-1", &invocation_id);
+        first.author = self.name().to_string();
+        first.llm_response.partial = true;
+        first.llm_response.content = Some(Content::new("model").with_text("Hello "));
+
+        let progress =
+            Event::tool_progress(&invocation_id, self.name(), "call-1", "stdout", "working\n");
+
+        let mut second = Event::with_id("response-1", &invocation_id);
+        second.author = self.name().to_string();
+        second.llm_response.partial = true;
+        second.llm_response.content = Some(Content::new("model").with_text("world"));
+
+        let mut terminal = Event::with_id("response-1", invocation_id);
+        terminal.author = self.name().to_string();
+        terminal.llm_response.turn_complete = true;
+
+        Ok(Box::pin(futures::stream::iter(vec![Ok(first), Ok(progress), Ok(second), Ok(terminal)])))
+    }
+}
+
 #[test]
 fn test_runner_creation() {
     let agent = Arc::new(MockAgent { name: "test_agent".to_string() });
@@ -180,6 +254,39 @@ async fn test_runner_run() {
         .await;
 
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn streamed_response_is_persisted_once_and_tool_progress_is_transient() {
+    let session_service = Arc::new(RecordingSessionService::default());
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(Arc::new(StreamingAgent) as Arc<dyn Agent>)
+        .session_service(session_service.clone() as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let content = Content::new("user").with_text("Hello");
+    let mut stream = runner
+        .run(UserId::new("user123").unwrap(), SessionId::new("session456").unwrap(), content)
+        .await
+        .unwrap();
+    while let Some(result) = stream.next().await {
+        result.unwrap();
+    }
+
+    let appended = session_service.appended.lock().expect("recording mutex poisoned");
+    let model_events: Vec<_> =
+        appended.iter().filter(|event| event.author == "streaming_agent").collect();
+    assert_eq!(model_events.len(), 1);
+    assert!(!model_events[0].llm_response.partial);
+    let text: String = model_events[0]
+        .content()
+        .into_iter()
+        .flat_map(|content| content.parts.iter().filter_map(Part::text))
+        .collect();
+    assert_eq!(text, "Hello world");
+    assert!(appended.iter().all(|event| event.tool_progress_stream().is_none()));
 }
 
 struct TransferAgent {

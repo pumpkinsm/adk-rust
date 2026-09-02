@@ -29,6 +29,13 @@ struct ActiveRun {
 type ActiveRuns = Arc<std::sync::Mutex<std::collections::HashMap<u64, ActiveRun>>>;
 
 fn preserve_streamed_content(accumulated: &mut HashMap<String, Content>, event: &mut Event) {
+    // Tool progress is a transient client update. Its event IDs are unique and
+    // intentionally have no terminal counterpart, so retaining it here would
+    // grow the accumulator for the lifetime of a long-running invocation.
+    if event.tool_progress_stream().is_some() {
+        return;
+    }
+
     if event.llm_response.partial {
         if let Some(chunk) = &event.llm_response.content {
             accumulated
@@ -936,17 +943,12 @@ impl Runner {
                             ctx.mutable_session().apply_state_delta(&event.actions.state_delta);
                         }
 
-                        // Also add the event to the mutable session's event list
-                        ctx.mutable_session().append_event(event.clone());
-
-                        // Append event to session service (persistent storage)
-                        // Skip partial streaming chunks — only persist the final
-                        // event. Streaming chunks share the same event ID, so
-                        // persisting each one would violate the primary key
-                        // constraint. The final chunk (partial=false) carries the
-                        // complete accumulated content.
-                        if !event.llm_response.partial
-                            && let Err(e) = session_service
+                        // Partial chunks, including tool progress, are transient.
+                        // Keep the mutable and persistent session histories aligned
+                        // by recording only the consolidated terminal event.
+                        if !event.llm_response.partial {
+                            ctx.mutable_session().append_event(event.clone());
+                            if let Err(e) = session_service
                                 .append_event_for_identity(adk_session::AppendEventRequest {
                                     identity: identity.clone(),
                                     event: event.clone(),
@@ -959,6 +961,7 @@ impl Runner {
                                 yield Err(e);
                                 return;
                             }
+                        }
                         yield Ok(event);
                     }
                     Err(e) => {
@@ -1212,11 +1215,9 @@ impl Runner {
                                 transfer_ctx.mutable_session().apply_state_delta(&event.actions.state_delta);
                             }
 
-                            // Add to mutable session
-                            transfer_ctx.mutable_session().append_event(event.clone());
-
-                            if !event.llm_response.partial
-                                && let Err(e) = session_service
+                            if !event.llm_response.partial {
+                                transfer_ctx.mutable_session().append_event(event.clone());
+                                if let Err(e) = session_service
                                     .append_event_for_identity(adk_session::AppendEventRequest {
                                         identity: identity.clone(),
                                         event: event.clone(),
@@ -1229,6 +1230,7 @@ impl Runner {
                                     yield Err(e);
                                     return;
                                 }
+                            }
                             yield Ok(event);
                         }
                         Err(e) => {
@@ -1610,5 +1612,16 @@ mod streamed_content_tests {
 
         assert_eq!(text(&final_event), "Verify the invoice.");
         assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn tool_progress_does_not_enter_llm_stream_accumulator() {
+        let mut accumulated = HashMap::new();
+        let mut progress = Event::tool_progress("inv-1", "agent", "call-1", "stdout", "working\n");
+
+        preserve_streamed_content(&mut accumulated, &mut progress);
+
+        assert!(accumulated.is_empty());
+        assert_eq!(text(&progress), "working\n");
     }
 }
