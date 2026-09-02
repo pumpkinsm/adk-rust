@@ -73,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenAI-compatible stream ordering** (`adk-model`): text held by the
+  text-tool parser is emitted before the terminal response, preventing a final
+  ambiguous fragment from appearing after completion or being skipped by
+  consumers that stop at the terminal event.
 - **OpenAI-compatible streaming usage** (`adk-model`): usage-only terminal
   chunks with empty `choices` attach token counts to the final response.
 - **Span parenting across suspension points** (`adk-agent`, `adk-runner`): one

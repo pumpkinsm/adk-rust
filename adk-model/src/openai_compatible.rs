@@ -514,6 +514,35 @@ fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
     })
 }
 
+fn finalize_stream_responses(
+    text_tool_buffer: &mut crate::tool_call_parser::ToolCallBuffer,
+    terminal_response: Option<LlmResponse>,
+) -> Vec<LlmResponse> {
+    let has_terminal_response = terminal_response.is_some();
+    let mut responses = Vec::new();
+
+    // Buffered text precedes the terminal event even when its prefix remained ambiguous.
+    for part in text_tool_buffer.flush() {
+        let is_tool = matches!(part, Part::FunctionCall { .. });
+        responses.push(LlmResponse {
+            content: Some(Content { role: "model".to_string(), parts: vec![part] }),
+            finish_reason: if is_tool && !has_terminal_response {
+                Some(FinishReason::Stop)
+            } else {
+                None
+            },
+            partial: !is_tool,
+            turn_complete: false,
+            ..Default::default()
+        });
+    }
+
+    if let Some(terminal_response) = terminal_response {
+        responses.push(terminal_response);
+    }
+    responses
+}
+
 #[async_trait]
 impl Llm for OpenAICompatible {
     fn name(&self) -> &str {
@@ -614,7 +643,10 @@ impl Llm for OpenAICompatible {
                         }
 
                         if line == "data: [DONE]" {
-                            if let Some(response) = pending_final_response.take() {
+                            for response in finalize_stream_responses(
+                                &mut text_tool_buffer,
+                                pending_final_response.take(),
+                            ) {
                                 yield response;
                             }
                             continue;
@@ -639,7 +671,12 @@ impl Llm for OpenAICompatible {
                                         && let Some(mut response) = pending_final_response.take()
                                     {
                                         response.usage_metadata = Some(usage_metadata);
-                                        yield response;
+                                        for response in finalize_stream_responses(
+                                            &mut text_tool_buffer,
+                                            Some(response),
+                                        ) {
+                                            yield response;
+                                        }
                                     }
                                     continue;
                                 }
@@ -731,7 +768,12 @@ impl Llm for OpenAICompatible {
                                         interaction_id: None,
                                     };
                                     if response.usage_metadata.is_some() {
-                                        yield response;
+                                        for response in finalize_stream_responses(
+                                            &mut text_tool_buffer,
+                                            Some(response),
+                                        ) {
+                                            yield response;
+                                        }
                                     } else {
                                         pending_final_response = Some(response);
                                     }
@@ -764,7 +806,12 @@ impl Llm for OpenAICompatible {
                                     interaction_id: None,
                                 };
                                 if response.usage_metadata.is_some() {
-                                    yield response;
+                                    for response in finalize_stream_responses(
+                                        &mut text_tool_buffer,
+                                        Some(response),
+                                    ) {
+                                        yield response;
+                                    }
                                 } else {
                                     pending_final_response = Some(response);
                                 }
@@ -835,29 +882,11 @@ impl Llm for OpenAICompatible {
                     }
                 }
 
-                if let Some(response) = pending_final_response.take() {
+                for response in finalize_stream_responses(
+                    &mut text_tool_buffer,
+                    pending_final_response.take(),
+                ) {
                     yield response;
-                }
-
-                // Flush any remaining buffered content from the tool call buffer
-                for part in text_tool_buffer.flush() {
-                    let is_tool = matches!(part, Part::FunctionCall { .. });
-                    yield LlmResponse {
-                        content: Some(Content {
-                            role: "model".to_string(),
-                            parts: vec![part],
-                        }),
-                        usage_metadata: None,
-                        finish_reason: if is_tool { Some(adk_core::FinishReason::Stop) } else { None },
-                        citation_metadata: None,
-                        partial: !is_tool,
-                        turn_complete: false,
-                        interrupted: false,
-                        error_code: None,
-                        error_message: None,
-                        provider_metadata: None,
-                        interaction_id: None,
-                    };
                 }
             };
 
@@ -1066,5 +1095,27 @@ mod tests {
         let config = OpenAICompatibleConfig::gemini("k", "gemini-3.5-flash");
         let client = OpenAICompatible::new(config).expect("client builds");
         assert_eq!(client.name(), "gemini-3.5-flash");
+    }
+
+    #[test]
+    fn buffered_text_precedes_terminal_response() {
+        let mut buffer = crate::tool_call_parser::ToolCallBuffer::new();
+        assert!(matches!(buffer.push("["), crate::tool_call_parser::BufferAction::Buffering));
+
+        let terminal = LlmResponse {
+            finish_reason: Some(FinishReason::Stop),
+            turn_complete: true,
+            ..Default::default()
+        };
+        let responses = finalize_stream_responses(&mut buffer, Some(terminal));
+
+        assert_eq!(responses.len(), 2);
+        let content = responses[0].content.as_ref().expect("buffered content should be emitted");
+        assert_eq!(content.role, "model");
+        assert!(matches!(content.parts.as_slice(), [Part::Text { text }] if text == "["));
+        assert!(responses[0].partial);
+        assert!(!responses[0].turn_complete);
+        assert_eq!(responses[1].finish_reason, Some(FinishReason::Stop));
+        assert!(responses[1].turn_complete);
     }
 }
