@@ -1,8 +1,7 @@
 #[cfg(feature = "skills")]
-pub(crate) use adk_skill::{SelectionPolicy, SkillIndex, apply_skill_injection, load_skill_index};
-
-#[cfg(all(feature = "skills", feature = "codeact"))]
-pub(crate) use adk_skill::select_skill_prompt_block;
+pub(crate) use adk_skill::{
+    SelectionPolicy, SkillIndex, apply_skill_injection, load_skill_index, select_skill_prompt_block,
+};
 
 #[cfg(not(feature = "skills"))]
 mod disabled {
@@ -18,7 +17,6 @@ mod disabled {
         _disabled: (),
     }
 
-    #[cfg(feature = "codeact")]
     pub(crate) fn select_skill_prompt_block(
         _index: &SkillIndex,
         _query: &str,
@@ -39,7 +37,6 @@ mod disabled {
 }
 
 #[cfg(not(feature = "skills"))]
-pub(crate) use disabled::{SelectionPolicy, SkillIndex, apply_skill_injection};
-
-#[cfg(all(not(feature = "skills"), feature = "codeact"))]
-pub(crate) use disabled::select_skill_prompt_block;
+pub(crate) use disabled::{
+    SelectionPolicy, SkillIndex, apply_skill_injection, select_skill_prompt_block,
+};

@@ -26,7 +26,7 @@ use crate::{
     guardrails::{
         GuardrailSet, ToolGuardrailSet, ToolScreening, enforce_guardrails, screen_tool_call,
     },
-    skill_shim::{SelectionPolicy, SkillIndex, apply_skill_injection},
+    skill_shim::{SelectionPolicy, SkillIndex, select_skill_prompt_block},
     tool_call_markup::normalize_option_content,
     workflow::with_user_content_override,
 };
@@ -312,29 +312,29 @@ impl PromptConfig {
         if let Some(provider) = &self.global_instruction_provider {
             let instruction = provider(ctx.clone() as Arc<dyn ReadonlyContext>).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         } else if let Some(template) = &self.global_instruction {
             let instruction = adk_core::inject_session_state(ctx.as_ref(), template).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         }
 
         if let Some(provider) = &self.instruction_provider {
             let instruction = provider(ctx.clone() as Arc<dyn ReadonlyContext>).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         } else if let Some(template) = &self.instruction {
             let instruction = adk_core::inject_session_state(ctx.as_ref(), template).await?;
             if !instruction.is_empty() {
-                preamble.push(Content::new("user").with_text(instruction));
+                preamble.push(Content::new("system").with_text(instruction));
             }
         }
 
         if let Some(schema) = &self.output_schema {
-            preamble.push(Content::new("user").with_text(format!(
+            preamble.push(Content::new("system").with_text(format!(
                 "You MUST respond with valid JSON conforming to this schema: {schema}. Do not include any text outside the JSON object."
             )));
         }
@@ -348,14 +348,22 @@ impl PromptConfig {
         };
         let mut session_history =
             ctx.session().conversation_history_scoped(agent_filter, ctx.branch());
-        let mut current_user_content = ctx.user_content().clone();
+        let current_user_content = ctx.user_content().clone();
         if let Some(index) = &self.skills_index {
-            apply_skill_injection(
-                &mut current_user_content,
+            let query = current_user_content
+                .parts
+                .iter()
+                .filter_map(Part::text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some((_, skill_block)) = select_skill_prompt_block(
                 index.as_ref(),
+                &query,
                 &self.skill_policy,
                 self.max_skill_chars,
-            );
+            ) {
+                preamble.push(Content::new("system").with_text(skill_block));
+            }
         }
         if let Some(index) = session_history.iter().rposition(|content| content.role == "user") {
             session_history[index] = current_user_content.clone();

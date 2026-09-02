@@ -483,16 +483,74 @@ async fn test_llm_agent_injects_skill_after_cacheable_prefix() {
         .iter()
         .map(|content| content.parts.iter().filter_map(Part::text).collect::<Vec<_>>().join("\n"))
         .collect::<Vec<_>>();
+    let roles = request.contents.iter().map(|content| content.role.as_str()).collect::<Vec<_>>();
 
-    assert_eq!(messages.len(), 6);
+    assert_eq!(messages.len(), 7);
+    assert_eq!(roles, vec!["system", "system", "system", "system", "user", "model", "user"]);
     assert_eq!(messages[0], "GLOBAL INSTRUCTION");
     assert_eq!(messages[1], "AGENT INSTRUCTION");
     assert!(messages[2].starts_with("You MUST respond with valid JSON"));
-    assert_eq!(messages[3], "Earlier question");
-    assert_eq!(messages[4], "Earlier answer");
-    assert!(messages[5].starts_with("[skill:search]"));
-    assert!(messages[5].contains("Use rg --files then rg <pattern>."));
-    assert!(messages[5].ends_with("Please search this repository"));
+    assert!(messages[3].starts_with("[skill:search]"));
+    assert!(messages[3].contains("Use rg --files then rg <pattern>."));
+    assert_eq!(messages[4], "Earlier question");
+    assert_eq!(messages[5], "Earlier answer");
+    assert_eq!(messages[6], "Please search this repository");
+}
+
+#[tokio::test]
+async fn instructions_remain_system_role_across_a_tool_call_history() {
+    let model = SpyLlm::new("{}");
+    let captured = model.last_request.clone();
+    let agent = LlmAgentBuilder::new("tool_history_agent")
+        .model(Arc::new(model))
+        .global_instruction("GLOBAL INSTRUCTION")
+        .instruction("AGENT INSTRUCTION")
+        .output_schema(serde_json::json!({"type": "object"}))
+        .build()
+        .unwrap();
+
+    let history = vec![
+        Content::new("user").with_text("Look it up"),
+        Content {
+            role: "model".to_string(),
+            parts: vec![Part::FunctionCall {
+                name: "lookup".to_string(),
+                args: serde_json::json!({"query": "value"}),
+                id: Some("call-1".to_string()),
+                thought_signature: None,
+            }],
+        },
+        Content {
+            role: "function".to_string(),
+            parts: vec![Part::FunctionResponse {
+                function_response: adk_core::FunctionResponseData::new(
+                    "lookup",
+                    serde_json::json!({"result": "value"}),
+                ),
+                id: Some("call-1".to_string()),
+                annotations: None,
+            }],
+        },
+        Content::new("user").with_text("Summarize it"),
+    ];
+    let ctx = Arc::new(TestContext::with_history("Summarize it", history));
+    let mut stream = agent.run(ctx).await.unwrap();
+
+    use futures::StreamExt;
+    while let Some(result) = stream.next().await {
+        result.unwrap();
+    }
+
+    let request = captured.lock().unwrap().clone().expect("expected captured request");
+    let roles = request.contents.iter().map(|content| content.role.as_str()).collect::<Vec<_>>();
+    assert_eq!(roles, vec!["system", "system", "system", "user", "model", "function", "user"]);
+    assert_eq!(request.contents[0].parts[0].text(), Some("GLOBAL INSTRUCTION"));
+    assert_eq!(request.contents[1].parts[0].text(), Some("AGENT INSTRUCTION"));
+    assert!(
+        request.contents[2].parts[0]
+            .text()
+            .is_some_and(|text| text.starts_with("You MUST respond with valid JSON"))
+    );
 }
 
 #[tokio::test]

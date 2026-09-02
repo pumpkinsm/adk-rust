@@ -196,11 +196,8 @@ impl AnthropicClient {
             }
         }
 
-        // Requirement 1.2: Heuristic — re-route leading user-role text-only messages
-        // to the system parameter when no explicit system-role content exists.
-        // The agent layer injects instructions as role="user" before session history.
-        // We detect consecutive user-only-text messages before the first assistant reply
-        // and move them to the system parameter.
+        // Compatibility fallback for callers that still encode instructions as
+        // leading user-role text instead of explicit system content.
         if system_parts.is_empty() {
             let instruction_boundary = messages
                 .iter()

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Agent, global, selected-skill, and output-schema instructions now use native
+  system-role content; OpenAI, Anthropic, and Gemini map it to their provider
+  system-instruction fields.
+
 ## [2.2.0] - 2026-09-01
 
 ### Added

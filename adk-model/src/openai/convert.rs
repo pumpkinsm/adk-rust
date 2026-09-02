@@ -490,6 +490,17 @@ mod tests {
     }
 
     #[test]
+    fn test_system_content_maps_to_openai_system_message() {
+        let message = serde_json::to_value(content_to_message(
+            &Content::new("system").with_text("Follow the policy"),
+        ))
+        .unwrap();
+
+        assert_eq!(message["role"], "system");
+        assert_eq!(message["content"], "Follow the policy");
+    }
+
+    #[test]
     fn test_user_message_with_inline_data_produces_array_content() {
         let content = Content {
             role: "user".to_string(),

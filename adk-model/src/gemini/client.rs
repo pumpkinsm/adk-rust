@@ -14,6 +14,19 @@ use futures::TryStreamExt;
 #[cfg(feature = "gemini-interactions")]
 use super::interactions_target::InteractionTarget;
 
+fn system_instruction_text(contents: &[Content]) -> Option<String> {
+    let text = contents
+        .iter()
+        .filter(|content| content.role == "system")
+        .flat_map(|content| &content.parts)
+        .filter_map(Part::text)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if text.is_empty() { None } else { Some(text) }
+}
+
 /// Which Gemini wire API a [`GeminiModel`] uses.
 ///
 /// Defaults to [`GeminiTransport::GenerateContent`], the classic
@@ -1032,6 +1045,9 @@ impl GeminiModel {
         stream: bool,
     ) -> Result<LlmResponseStream> {
         let mut builder = self.client.generate_content();
+        if let Some(system_instruction) = system_instruction_text(&req.contents) {
+            builder = builder.with_system_instruction(system_instruction);
+        }
 
         // Build a map of function_name → thought_signature from FunctionCall parts
         // in model content. Gemini 3.x requires thought_signature on FunctionResponse
@@ -1988,6 +2004,20 @@ mod tests {
         }
 
         accepts_sync_constructor(|api_key, model| GeminiModel::new(api_key, model));
+    }
+
+    #[test]
+    fn extracts_multiple_system_contents_for_native_gemini_instruction() {
+        let contents = vec![
+            Content::new("system").with_text("Global policy"),
+            Content::new("user").with_text("Question"),
+            Content::new("system").with_text("Agent policy"),
+        ];
+
+        assert_eq!(
+            system_instruction_text(&contents).as_deref(),
+            Some("Global policy\n\nAgent policy")
+        );
     }
 
     #[test]
