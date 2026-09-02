@@ -199,6 +199,22 @@ fn extract_text(parts: &[Part]) -> String {
         .join("\n")
 }
 
+/// Extract structured reasoning without mixing it into visible message text.
+pub(crate) fn extract_reasoning_content(parts: &[Part]) -> Option<String> {
+    let reasoning = parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Thinking { thinking, .. } if !thinking.trim().is_empty() => {
+                Some(thinking.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if reasoning.is_empty() { None } else { Some(reasoning) }
+}
+
 /// Get text content if any exists.
 fn get_text_content(parts: &[Part]) -> Option<String> {
     let text = extract_text(parts);
@@ -489,6 +505,7 @@ mod tests {
         ];
 
         assert_eq!(extract_text(&parts), "visible answer");
+        assert_eq!(extract_reasoning_content(&parts).as_deref(), Some("private reasoning"));
     }
 
     #[test]

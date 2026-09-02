@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- OpenAI-compatible clients can replay assistant Thinking through one explicitly
+  selected `reasoning` or `reasoning_content` field; strict providers receive
+  neither field by default.
+
 ## [2.2.0] - 2026-09-01
 
 ### Added
