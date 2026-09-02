@@ -1,4 +1,8 @@
 use adk_core::{AdkError, Result};
+#[cfg(any(feature = "openai", test))]
+use futures::{Stream, StreamExt};
+#[cfg(any(feature = "openai", test))]
+use std::pin::Pin;
 use std::{future::Future, time::Duration};
 
 /// Configuration for automatic retry with exponential backoff.
@@ -117,6 +121,106 @@ fn next_retry_delay(current: Duration, retry_config: &RetryConfig) -> Duration {
     scaled.min(retry_config.max_delay)
 }
 
+#[cfg(any(feature = "openai", test))]
+async fn wait_before_stream_retry(
+    retry_config: &RetryConfig,
+    attempt: &mut u32,
+    delay: &mut Duration,
+    error: &AdkError,
+    stage: &'static str,
+) {
+    *attempt += 1;
+    let effective_delay = error.retry.retry_after().unwrap_or(*delay);
+    adk_telemetry::warn!(
+        attempt = *attempt,
+        max_retries = retry_config.max_retries,
+        delay_ms = effective_delay.as_millis(),
+        retry_stage = stage,
+        error = %error,
+        "Provider stream failed before output; retrying"
+    );
+    tokio::time::sleep(effective_delay).await;
+    *delay = next_retry_delay(*delay, retry_config);
+}
+
+/// Execute a stream-producing operation with automatic retry until the first
+/// item has been emitted.
+///
+/// Failures while creating or reading the stream share one retry budget. Once
+/// any item has been yielded to the caller, later failures are propagated
+/// without retrying so text, reasoning, tool calls, or metadata are never
+/// replayed.
+#[cfg(any(feature = "openai", test))]
+pub(crate) fn execute_stream_with_retry<T, Op, Fut, S, Classify>(
+    retry_config: RetryConfig,
+    classify_error: Classify,
+    mut operation: Op,
+) -> Pin<Box<dyn Stream<Item = Result<T>> + Send>>
+where
+    T: Send + 'static,
+    Op: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<S>> + Send + 'static,
+    S: Stream<Item = Result<T>> + Send + 'static,
+    Classify: Fn(&AdkError) -> bool + Send + Sync + 'static,
+{
+    Box::pin(async_stream::try_stream! {
+        let mut attempt = 0;
+        let mut delay = retry_config.initial_delay;
+
+        'attempt: loop {
+            let stream = match operation().await {
+                Ok(stream) => stream,
+                Err(error)
+                    if retry_config.enabled
+                        && attempt < retry_config.max_retries
+                        && classify_error(&error) =>
+                {
+                    wait_before_stream_retry(
+                        &retry_config,
+                        &mut attempt,
+                        &mut delay,
+                        &error,
+                        "stream_start",
+                    )
+                    .await;
+                    continue 'attempt;
+                }
+                Err(error) => Err(error)?,
+            };
+            tokio::pin!(stream);
+            let mut output_committed = false;
+
+            while let Some(item) = stream.as_mut().next().await {
+                match item {
+                    Ok(value) => {
+                        output_committed = true;
+                        yield value;
+                    }
+                    Err(error)
+                        if !output_committed
+                            && retry_config.enabled
+                            && attempt < retry_config.max_retries
+                            && classify_error(&error) =>
+                    {
+                        wait_before_stream_retry(
+                            &retry_config,
+                            &mut attempt,
+                            &mut delay,
+                            &error,
+                            "stream_read_before_output",
+                        )
+                        .await;
+                        continue 'attempt;
+                    }
+                    Err(error) => Err(error)?,
+                }
+            }
+
+            break;
+        }
+    })
+}
+
 /// Hint from the server about when to retry.
 ///
 /// When the server provides a `retry-after` header, this hint overrides the
@@ -212,6 +316,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adk_core::{ErrorCategory, ErrorComponent};
+    use futures::stream;
     use std::sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -404,5 +510,93 @@ mod tests {
 
         // Gap 2 should be roughly double gap 1 (with tolerance for scheduling).
         assert!(gap2 >= gap1, "backoff should increase: gap2={gap2:?} should be >= gap1={gap1:?}");
+    }
+
+    fn retryable_stream_error() -> AdkError {
+        AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Unavailable,
+            "model.test.stream_read",
+            "response body interrupted",
+        )
+    }
+
+    #[tokio::test]
+    async fn stream_retry_restarts_when_read_fails_before_output() {
+        let retry_config = RetryConfig::default()
+            .with_max_retries(1)
+            .with_initial_delay(Duration::ZERO)
+            .with_max_delay(Duration::ZERO);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let operation_attempts = Arc::clone(&attempts);
+
+        let output = execute_stream_with_retry(retry_config, is_retryable_model_error, move || {
+            let attempt = operation_attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                let items = if attempt == 0 {
+                    vec![Err(retryable_stream_error())]
+                } else {
+                    vec![Ok("answer")]
+                };
+                Ok::<_, AdkError>(stream::iter(items))
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].as_ref().expect("retry should succeed"), &"answer");
+    }
+
+    #[tokio::test]
+    async fn stream_retry_does_not_replay_after_thinking_output() {
+        let retry_config = RetryConfig::default()
+            .with_max_retries(2)
+            .with_initial_delay(Duration::ZERO)
+            .with_max_delay(Duration::ZERO);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let operation_attempts = Arc::clone(&attempts);
+
+        let output = execute_stream_with_retry(retry_config, is_retryable_model_error, move || {
+            operation_attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Ok::<_, AdkError>(stream::iter(vec![Ok("thinking"), Err(retryable_stream_error())]))
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].as_ref().expect("thinking is preserved"), &"thinking");
+        assert!(output[1].is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_retry_shares_budget_with_stream_creation_failures() {
+        let retry_config = RetryConfig::default()
+            .with_max_retries(1)
+            .with_initial_delay(Duration::ZERO)
+            .with_max_delay(Duration::ZERO);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let operation_attempts = Arc::clone(&attempts);
+
+        let output = execute_stream_with_retry(retry_config, is_retryable_model_error, move || {
+            let attempt = operation_attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(retryable_stream_error())
+                } else {
+                    Ok(stream::iter(vec![Ok("answer")]))
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].as_ref().expect("retry should succeed"), &"answer");
     }
 }

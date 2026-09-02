@@ -8,8 +8,14 @@
 #[cfg(feature = "openai")]
 mod streaming_exploration {
     use adk_core::{Content, Llm, LlmRequest, Part};
+    use adk_model::RetryConfig;
     use adk_model::openai_compatible::{OpenAICompatible, OpenAICompatibleConfig};
     use futures::StreamExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -38,22 +44,21 @@ mod streaming_exploration {
     async fn stream_flag_present_in_request_body() {
         let server = MockServer::start().await;
 
-        // Return a valid non-streaming response so the call doesn't error out.
-        // The important thing is capturing what was SENT.
-        let body = serde_json::json!({
-            "id": "chatcmpl-1",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": "Hi" },
-                "finish_reason": "stop"
-            }],
-            "usage": { "prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6 }
-        });
+        // Return a complete SSE response. The important thing is capturing
+        // what was sent without triggering the incomplete-stream path.
+        let body = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
 
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -274,6 +279,106 @@ mod streaming_exploration {
             combined_thinking.contains("Let me think"),
             "thinking content should contain the reasoning text"
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_retries_before_any_output() {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response_attempts = Arc::clone(&attempts);
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |_: &wiremock::Request| {
+                let attempt = response_attempts.fetch_add(1, Ordering::SeqCst);
+                let body = if attempt == 0 {
+                    String::new()
+                } else {
+                    concat!(
+                        "data: {\"id\":\"chatcmpl-second\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"chatcmpl-second\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .to_string()
+                };
+                ResponseTemplate::new(200)
+                    .set_body_string(body)
+                    .insert_header("content-type", "text/event-stream")
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let config = OpenAICompatibleConfig::new("test-key", "gpt-4o")
+            .with_provider_name("test")
+            .with_base_url(server.uri());
+        let client = OpenAICompatible::new(config)
+            .expect("client creation should succeed")
+            .with_retry_config(
+                RetryConfig::default()
+                    .with_max_retries(1)
+                    .with_initial_delay(Duration::ZERO)
+                    .with_max_delay(Duration::ZERO),
+            );
+        let output = client
+            .generate_content(make_request(), true)
+            .await
+            .expect("generate_content should create the retried stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(output.iter().all(Result::is_ok));
+        assert!(output.iter().any(|item| {
+            item.as_ref().ok().and_then(|response| response.content.as_ref()).is_some_and(
+                |content| {
+                    matches!(&content.parts[..], [Part::Text { text }] if text == "recovered")
+                },
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_does_not_retry_after_thinking_output() {
+        let server = MockServer::start().await;
+        let body = "data: {\"id\":\"chatcmpl-partial\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"partial thought\"},\"finish_reason\":null}]}\n\n";
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = OpenAICompatibleConfig::new("test-key", "gpt-4o")
+            .with_provider_name("test")
+            .with_base_url(server.uri());
+        let client = OpenAICompatible::new(config)
+            .expect("client creation should succeed")
+            .with_retry_config(
+                RetryConfig::default()
+                    .with_max_retries(1)
+                    .with_initial_delay(Duration::ZERO)
+                    .with_max_delay(Duration::ZERO),
+            );
+        let output = client
+            .generate_content(make_request(), true)
+            .await
+            .expect("generate_content should create the stream")
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(output.len(), 2);
+        let first = output[0].as_ref().expect("thinking output is preserved");
+        assert!(first.content.as_ref().is_some_and(|content| {
+            matches!(&content.parts[..], [Part::Thinking { thinking, .. }] if thinking == "partial thought")
+        }));
+        let error = output[1].as_ref().expect_err("incomplete stream remains an error");
+        assert_eq!(error.code, "model.openai_compat.stream_incomplete");
     }
 
     // ── Test 4: tool_calls chunks accumulated and yielded on finish ──────

@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenAI-compatible interrupted streams** (`adk-model`): transient request
+  and stream-read failures now share one retry budget and are retried only
+  before the first response item is emitted. Once text, reasoning, tool-call,
+  or metadata output is visible, later failures are surfaced without replaying
+  already committed output.
 - **OpenAI-compatible streaming usage** (`adk-model`): usage-only terminal
   chunks with empty `choices` attach token counts to the final response.
 - **Span parenting across suspension points** (`adk-agent`, `adk-runner`): one

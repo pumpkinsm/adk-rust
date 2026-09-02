@@ -1,7 +1,9 @@
 //! Shared OpenAI-compatible provider implementation.
 
 use crate::openai::{OpenAIReasoningEffort, convert};
-use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
+use crate::retry::{
+    RetryConfig, execute_stream_with_retry, execute_with_retry, is_retryable_model_error,
+};
 use adk_core::{
     AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm,
     LlmRequest, LlmResponse, LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
@@ -468,6 +470,29 @@ async fn send_request(
     Ok(http_resp)
 }
 
+fn stream_read_error(provider_name: &str, error: reqwest::Error) -> AdkError {
+    let category =
+        if error.is_timeout() { ErrorCategory::Timeout } else { ErrorCategory::Unavailable };
+    AdkError::new(
+        ErrorComponent::Model,
+        category,
+        "model.openai_compat.stream_read",
+        format!("{provider_name} stream read error: {error}"),
+    )
+    .with_provider(provider_name)
+    .with_source(error)
+}
+
+fn incomplete_stream_error(provider_name: &str) -> AdkError {
+    AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::Unavailable,
+        "model.openai_compat.stream_incomplete",
+        format!("{provider_name} stream ended before a completion marker"),
+    )
+    .with_provider(provider_name)
+}
+
 /// Parse a finish_reason string into an ADK `FinishReason`.
 fn parse_finish_reason(fr: &str) -> FinishReason {
     match fr {
@@ -562,168 +587,216 @@ impl Llm for OpenAICompatible {
 
         if stream {
             // ── Streaming path ──────────────────────────────────────
-            let response_stream = try_stream! {
-                // Inject streaming fields into the pre-built request body.
-                let mut body = request_body.clone();
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert("stream".to_string(), serde_json::json!(true));
-                    obj.insert(
-                        "stream_options".to_string(),
-                        serde_json::json!({"include_usage": true}),
-                    );
-                }
+            // Every retry sends an identical request and reconstructs all parser state.
+            let mut body = request_body.clone();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("stream".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "stream_options".to_string(),
+                    serde_json::json!({"include_usage": true}),
+                );
+            }
+            let url = format!("{base_url}/chat/completions");
 
-                let url = format!("{base_url}/chat/completions");
+            let operation = move || {
+                let http = http.clone();
+                let url = url.clone();
+                let api_key = api_key.clone();
+                let organization_id = organization_id.clone();
+                let body = body.clone();
+                let provider_name = provider_name.clone();
+                async move {
+                    let response = send_request(
+                        &http,
+                        &url,
+                        &api_key,
+                        &organization_id,
+                        &body,
+                        &provider_name,
+                    )
+                    .await?;
 
-                // Retry covers only the initial HTTP request, not stream consumption.
-                let response = execute_with_retry(&retry_config, is_retryable_model_error, || {
-                    let http = http.clone();
-                    let url = url.clone();
-                    let api_key = api_key.clone();
-                    let organization_id = organization_id.clone();
-                    let body = body.clone();
-                    let provider_name = provider_name.clone();
-                    async move {
-                        send_request(&http, &url, &api_key, &organization_id, &body, &provider_name).await
-                    }
-                })
-                .await?;
+                    let response_stream = try_stream! {
+                    let mut stream_completed = false;
 
-                // Process SSE byte stream (following DeepSeekClient pattern).
-                let mut byte_stream = response.bytes_stream();
-                let mut buffer = String::new();
-                let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
-                    HashMap::new();
-                let mut text_tool_buffer = crate::tool_call_parser::ToolCallBuffer::new();
-                let mut pending_final_response: Option<LlmResponse> = None;
+                    // Process SSE byte stream (following DeepSeekClient pattern).
+                    let mut byte_stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
+                        HashMap::new();
+                    let mut text_tool_buffer = crate::tool_call_parser::ToolCallBuffer::new();
+                    let mut pending_final_response: Option<LlmResponse> = None;
 
-                while let Some(chunk_result) = byte_stream.next().await {
-                    let chunk = chunk_result.map_err(|e| {
-                        AdkError::model(format!("stream read error: {e}"))
-                    })?;
-
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                    // Process complete SSE lines.
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer = buffer[line_end + 1..].to_string();
-
-                        if line.is_empty() {
-                            continue;
-                        }
-
-                        if line == "data: [DONE]" {
-                            if let Some(response) = pending_final_response.take() {
-                                yield response;
+                    while let Some(chunk_result) = byte_stream.next().await {
+                        let chunk = match chunk_result {
+                            Ok(chunk) => chunk,
+                            Err(error) if stream_completed => {
+                                tracing::debug!(
+                                    error = %error,
+                                    "ignoring OpenAI-compatible stream error after completion"
+                                );
+                                break;
                             }
-                            continue;
-                        }
+                            Err(error) => Err(stream_read_error(&provider_name, error))?,
+                        };
 
-                        if let Some(data) = line.strip_prefix("data: ") {
-                            let chunk_json: serde_json::Value = match serde_json::from_str(data) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "failed to parse SSE chunk: {e} - {data}"
-                                    );
-                                    continue;
+                        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                        // Process complete SSE lines.
+                        while let Some(line_end) = buffer.find('\n') {
+                            let line = buffer[..line_end].trim().to_string();
+                            buffer = buffer[line_end + 1..].to_string();
+
+                            if line.is_empty() {
+                                continue;
+                            }
+
+                            if line == "data: [DONE]" {
+                                stream_completed = true;
+                                if let Some(response) = pending_final_response.take() {
+                                    yield response;
                                 }
-                            };
-                            let usage_metadata = parse_usage_from_chunk(&chunk_json);
+                                continue;
+                            }
 
-                            let choice = match chunk_json.get("choices").and_then(|c| c.get(0)) {
-                                Some(c) => c,
-                                None => {
-                                    if let Some(usage_metadata) = usage_metadata
-                                        && let Some(mut response) = pending_final_response.take()
-                                    {
-                                        response.usage_metadata = Some(usage_metadata);
-                                        yield response;
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                let chunk_json: serde_json::Value = match serde_json::from_str(data) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "failed to parse SSE chunk: {e} - {data}"
+                                        );
+                                        continue;
                                     }
-                                    continue;
-                                }
-                            };
-                            let delta = match choice.get("delta") {
-                                Some(d) => d,
-                                None => continue,
-                            };
+                                };
+                                let usage_metadata = parse_usage_from_chunk(&chunk_json);
 
-                            let finish_reason_str = choice
-                                .get("finish_reason")
-                                .and_then(|v| v.as_str())
-                                .map(String::from);
-
-                            // Accumulate tool calls by index.
-                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                                for tc in tool_calls {
-                                    let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                    let entry = tool_call_accumulators
-                                        .entry(index)
-                                        .or_insert_with(|| {
-                                            let call_id = tc
-                                                .get("id")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
-                                            (call_id, String::new(), String::new())
-                                        });
-
-                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str())
-                                        && !id.is_empty() {
-                                            entry.0 = id.to_string();
-                                        }
-
-                                    if let Some(func) = tc.get("function") {
-                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                            entry.1 = name.to_string();
-                                        }
-                                        if let Some(args_chunk) =
-                                            func.get("arguments").and_then(|v| v.as_str())
+                                let choice = match chunk_json.get("choices").and_then(|c| c.get(0)) {
+                                    Some(c) => c,
+                                    None => {
+                                        if let Some(usage_metadata) = usage_metadata
+                                            && let Some(mut response) = pending_final_response.take()
                                         {
-                                            entry.2.push_str(args_chunk);
+                                            response.usage_metadata = Some(usage_metadata);
+                                            yield response;
+                                        }
+                                        continue;
+                                    }
+                                };
+                                let delta = match choice.get("delta") {
+                                    Some(d) => d,
+                                    None => continue,
+                                };
+
+                                let finish_reason_str = choice
+                                    .get("finish_reason")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
+
+                                // Accumulate tool calls by index.
+                                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                    for tc in tool_calls {
+                                        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                        let entry = tool_call_accumulators
+                                            .entry(index)
+                                            .or_insert_with(|| {
+                                                let call_id = tc
+                                                    .get("id")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                (call_id, String::new(), String::new())
+                                            });
+
+                                        if let Some(id) = tc.get("id").and_then(|v| v.as_str())
+                                            && !id.is_empty() {
+                                                entry.0 = id.to_string();
+                                            }
+
+                                        if let Some(func) = tc.get("function") {
+                                            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                entry.1 = name.to_string();
+                                            }
+                                            if let Some(args_chunk) =
+                                                func.get("arguments").and_then(|v| v.as_str())
+                                            {
+                                                entry.2.push_str(args_chunk);
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            // Check for finish_reason → emit final response.
-                            if let Some(ref fr) = finish_reason_str {
-                                let finish_reason = Some(parse_finish_reason(fr));
+                                // Check for finish_reason → emit final response.
+                                if let Some(ref fr) = finish_reason_str {
+                                    stream_completed = true;
+                                    let finish_reason = Some(parse_finish_reason(fr));
 
-                                // Emit accumulated tool calls if any.
-                                if !tool_call_accumulators.is_empty() {
-                                    let mut sorted_calls: Vec<_> =
-                                        tool_call_accumulators.drain().collect();
-                                    sorted_calls.sort_by_key(|(idx, _)| *idx);
+                                    // Emit accumulated tool calls if any.
+                                    if !tool_call_accumulators.is_empty() {
+                                        let mut sorted_calls: Vec<_> =
+                                            tool_call_accumulators.drain().collect();
+                                        sorted_calls.sort_by_key(|(idx, _)| *idx);
 
-                                    let parts: Vec<Part> = sorted_calls
-                                        .into_iter()
-                                        .map(|(_, (id, name, args_str))| {
-                                            let args: serde_json::Value =
-                                                serde_json::from_str(&args_str)
-                                                    .unwrap_or(serde_json::json!({}));
-                                            Part::FunctionCall {
-                                                name,
-                                                args,
-                                                id: Some(id),
-                                                thought_signature: None,
-                                            }
-                                        })
-                                        .collect();
+                                        let parts: Vec<Part> = sorted_calls
+                                            .into_iter()
+                                            .map(|(_, (id, name, args_str))| {
+                                                let args: serde_json::Value =
+                                                    serde_json::from_str(&args_str)
+                                                        .unwrap_or(serde_json::json!({}));
+                                                Part::FunctionCall {
+                                                    name,
+                                                    args,
+                                                    id: Some(id),
+                                                    thought_signature: None,
+                                                }
+                                            })
+                                            .collect();
+
+                                        let response = LlmResponse {
+                                            content: Some(Content {
+                                                role: "model".to_string(),
+                                                parts,
+                                            }),
+                                            usage_metadata,
+                                            finish_reason,
+                                            citation_metadata: None,
+                                            partial: false,
+                                            // Tool-call turns are not complete — tool
+                                            // results must still be processed (issue #401).
+                                            turn_complete: false,
+                                            interrupted: false,
+                                            error_code: None,
+                                            error_message: None,
+                                            provider_metadata: None,
+                                            interaction_id: None,
+                                        };
+                                        if response.usage_metadata.is_some() {
+                                            yield response;
+                                        } else {
+                                            pending_final_response = Some(response);
+                                        }
+                                        continue;
+                                    }
+
+                                    // Final response without tool calls.
+                                    let mut parts = Vec::new();
+                                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                                        && !text.is_empty() {
+                                            parts.push(Part::Text { text: text.to_string() });
+                                        }
 
                                     let response = LlmResponse {
-                                        content: Some(Content {
-                                            role: "model".to_string(),
-                                            parts,
-                                        }),
+                                        content: if parts.is_empty() { None } else {
+                                            Some(Content {
+                                                role: "model".to_string(),
+                                                parts,
+                                            })
+                                        },
                                         usage_metadata,
                                         finish_reason,
                                         citation_metadata: None,
                                         partial: false,
-                                        // Tool-call turns are not complete — tool
-                                        // results must still be processed (issue #401).
-                                        turn_complete: false,
+                                        turn_complete: true,
                                         interrupted: false,
                                         error_code: None,
                                         error_message: None,
@@ -738,130 +811,106 @@ impl Llm for OpenAICompatible {
                                     continue;
                                 }
 
-                                // Final response without tool calls.
-                                let mut parts = Vec::new();
+                                // Emit partial reasoning_content as Part::Thinking.
+                                // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
+                                let reasoning = delta.get("reasoning_content")
+                                    .or_else(|| delta.get("reasoning"))
+                                    .and_then(|v| v.as_str());
+                                if let Some(reasoning) = reasoning
+                                    && !reasoning.is_empty() {
+                                        yield LlmResponse {
+                                            content: Some(Content {
+                                                role: "model".to_string(),
+                                                parts: vec![Part::Thinking {
+                                                    thinking: reasoning.to_string(),
+                                                    signature: None,
+                                                }],
+                                            }),
+                                            usage_metadata: None,
+                                            finish_reason: None,
+                                            citation_metadata: None,
+                                            partial: true,
+                                            turn_complete: false,
+                                            interrupted: false,
+                                            error_code: None,
+                                            error_message: None,
+                                            provider_metadata: None,
+                                            interaction_id: None,
+                                        };
+                                    }
+
+                                // Emit partial text content via tool call buffer.
+                                // The buffer detects <tool_call> tags split across chunks
+                                // and converts them to Part::FunctionCall.
                                 if let Some(text) = delta.get("content").and_then(|v| v.as_str())
                                     && !text.is_empty() {
-                                        parts.push(Part::Text { text: text.to_string() });
-                                    }
-
-                                let response = LlmResponse {
-                                    content: if parts.is_empty() { None } else {
-                                        Some(Content {
-                                            role: "model".to_string(),
-                                            parts,
-                                        })
-                                    },
-                                    usage_metadata,
-                                    finish_reason,
-                                    citation_metadata: None,
-                                    partial: false,
-                                    turn_complete: true,
-                                    interrupted: false,
-                                    error_code: None,
-                                    error_message: None,
-                                    provider_metadata: None,
-                                    interaction_id: None,
-                                };
-                                if response.usage_metadata.is_some() {
-                                    yield response;
-                                } else {
-                                    pending_final_response = Some(response);
-                                }
-                                continue;
-                            }
-
-                            // Emit partial reasoning_content as Part::Thinking.
-                            // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
-                            let reasoning = delta.get("reasoning_content")
-                                .or_else(|| delta.get("reasoning"))
-                                .and_then(|v| v.as_str());
-                            if let Some(reasoning) = reasoning
-                                && !reasoning.is_empty() {
-                                    yield LlmResponse {
-                                        content: Some(Content {
-                                            role: "model".to_string(),
-                                            parts: vec![Part::Thinking {
-                                                thinking: reasoning.to_string(),
-                                                signature: None,
-                                            }],
-                                        }),
-                                        usage_metadata: None,
-                                        finish_reason: None,
-                                        citation_metadata: None,
-                                        partial: true,
-                                        turn_complete: false,
-                                        interrupted: false,
-                                        error_code: None,
-                                        error_message: None,
-                                        provider_metadata: None,
-                                        interaction_id: None,
-                                    };
-                                }
-
-                            // Emit partial text content via tool call buffer.
-                            // The buffer detects <tool_call> tags split across chunks
-                            // and converts them to Part::FunctionCall.
-                            if let Some(text) = delta.get("content").and_then(|v| v.as_str())
-                                && !text.is_empty() {
-                                    match text_tool_buffer.push(text) {
-                                        crate::tool_call_parser::BufferAction::Emit(parts) => {
-                                            for part in parts {
-                                                let is_tool = matches!(part, Part::FunctionCall { .. });
-                                                yield LlmResponse {
-                                                    content: Some(Content {
-                                                        role: "model".to_string(),
-                                                        parts: vec![part],
-                                                    }),
-                                                    usage_metadata: None,
-                                                    finish_reason: None,
-                                                    citation_metadata: None,
-                                                    partial: !is_tool,
-                                                    turn_complete: false,
-                                                    interrupted: false,
-                                                    error_code: None,
-                                                    error_message: None,
-                                                    provider_metadata: None,
-                                                    interaction_id: None,
-                                                };
+                                        match text_tool_buffer.push(text) {
+                                            crate::tool_call_parser::BufferAction::Emit(parts) => {
+                                                for part in parts {
+                                                    let is_tool = matches!(part, Part::FunctionCall { .. });
+                                                    yield LlmResponse {
+                                                        content: Some(Content {
+                                                            role: "model".to_string(),
+                                                            parts: vec![part],
+                                                        }),
+                                                        usage_metadata: None,
+                                                        finish_reason: None,
+                                                        citation_metadata: None,
+                                                        partial: !is_tool,
+                                                        turn_complete: false,
+                                                        interrupted: false,
+                                                        error_code: None,
+                                                        error_message: None,
+                                                        provider_metadata: None,
+                                                        interaction_id: None,
+                                                    };
+                                                }
+                                            }
+                                            crate::tool_call_parser::BufferAction::Buffering => {
+                                                // Still accumulating a potential tool call
                                             }
                                         }
-                                        crate::tool_call_parser::BufferAction::Buffering => {
-                                            // Still accumulating a potential tool call
-                                        }
                                     }
-                                }
+                            }
                         }
                     }
-                }
 
-                if let Some(response) = pending_final_response.take() {
-                    yield response;
-                }
+                    if !stream_completed {
+                        Err(incomplete_stream_error(&provider_name))?;
+                    }
 
-                // Flush any remaining buffered content from the tool call buffer
-                for part in text_tool_buffer.flush() {
-                    let is_tool = matches!(part, Part::FunctionCall { .. });
-                    yield LlmResponse {
-                        content: Some(Content {
-                            role: "model".to_string(),
-                            parts: vec![part],
-                        }),
-                        usage_metadata: None,
-                        finish_reason: if is_tool { Some(adk_core::FinishReason::Stop) } else { None },
-                        citation_metadata: None,
-                        partial: !is_tool,
-                        turn_complete: false,
-                        interrupted: false,
-                        error_code: None,
-                        error_message: None,
-                        provider_metadata: None,
-                        interaction_id: None,
-                    };
+                    if let Some(response) = pending_final_response.take() {
+                        yield response;
+                    }
+
+                    // Flush any remaining buffered content from the tool call buffer
+                    for part in text_tool_buffer.flush() {
+                        let is_tool = matches!(part, Part::FunctionCall { .. });
+                        yield LlmResponse {
+                            content: Some(Content {
+                                role: "model".to_string(),
+                                parts: vec![part],
+                            }),
+                            usage_metadata: None,
+                            finish_reason: if is_tool { Some(adk_core::FinishReason::Stop) } else { None },
+                            citation_metadata: None,
+                            partial: !is_tool,
+                            turn_complete: false,
+                            interrupted: false,
+                            error_code: None,
+                            error_message: None,
+                            provider_metadata: None,
+                            interaction_id: None,
+                        };
+                    }
+                        };
+                    Ok::<LlmResponseStream, AdkError>(Box::pin(response_stream))
                 }
             };
+            let response_stream =
+                execute_stream_with_retry(retry_config, is_retryable_model_error, operation);
 
-            Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
+            Ok(crate::usage_tracking::with_usage_tracking(response_stream, usage_span))
         } else {
             // ── Non-streaming path (preserved identically) ──────────
             let response_stream = try_stream! {
