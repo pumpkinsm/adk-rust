@@ -179,7 +179,10 @@ impl SessionService for RecordingSessionService {
     }
 }
 
-struct StreamingAgent;
+#[derive(Default)]
+struct StreamingAgent {
+    context: Mutex<Option<Arc<dyn InvocationContext>>>,
+}
 
 #[async_trait]
 impl Agent for StreamingAgent {
@@ -196,6 +199,7 @@ impl Agent for StreamingAgent {
     }
 
     async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        *self.context.lock().expect("context mutex poisoned") = Some(ctx.clone());
         let invocation_id = ctx.invocation_id().to_string();
         let mut first = Event::with_id("response-1", &invocation_id);
         first.author = self.name().to_string();
@@ -259,9 +263,10 @@ async fn test_runner_run() {
 #[tokio::test]
 async fn streamed_response_is_persisted_once_and_tool_progress_is_transient() {
     let session_service = Arc::new(RecordingSessionService::default());
+    let agent = Arc::new(StreamingAgent::default());
     let runner = Runner::builder()
         .app_name("test_app")
-        .agent(Arc::new(StreamingAgent) as Arc<dyn Agent>)
+        .agent(agent.clone() as Arc<dyn Agent>)
         .session_service(session_service.clone() as Arc<dyn SessionService>)
         .build()
         .unwrap();
@@ -287,6 +292,18 @@ async fn streamed_response_is_persisted_once_and_tool_progress_is_transient() {
         .collect();
     assert_eq!(text, "Hello world");
     assert!(appended.iter().all(|event| event.tool_progress_stream().is_none()));
+
+    let context = agent
+        .context
+        .lock()
+        .expect("context mutex poisoned")
+        .clone()
+        .expect("agent context should be captured");
+    let history = context.session().conversation_history();
+    let model_messages: Vec<_> = history.iter().filter(|content| content.role == "model").collect();
+    assert_eq!(model_messages.len(), 1);
+    let history_text: String = model_messages[0].parts.iter().filter_map(Part::text).collect();
+    assert_eq!(history_text, "Hello world");
 }
 
 struct TransferAgent {
